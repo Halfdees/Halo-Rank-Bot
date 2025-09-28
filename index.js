@@ -1,83 +1,179 @@
-import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
-import fetch from 'undici';
-import cron from 'node-cron';
+// Halo CSR Rank Bot — Nicknames + Roles + CSR fallback
+// Node 18+. Deps: discord.js, node-cron, undici
+
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder, PermissionFlagsBits } from "discord.js";
+import cron from "node-cron";
+import { request } from "undici";
+import fs from "fs/promises";
+import path from "path";
+
+const {
+  DISCORD_TOKEN,
+  GUILD_ID,
+  HALO_ENDPOINT,
+  HALO_SHARED_SECRET,
+  RANK_PLAYLIST_ID = "edfef3ac-9cbe-4fa2-b949-8f29deafd483",
+  ENABLE_NICKNAME_UPDATES = "true",
+  CRON_HOURS = "6",
+} = process.env;
+
+// CSR fallback ranges (used if wrapper returns csr but no tier label)
+const CSR_RANGES = [
+  { role: "Onyx",     min: 1800, max: Infinity },
+  { role: "Diamond",  min: 1500, max: 1799 },
+  { role: "Platinum", min: 1300, max: 1499 },
+  { role: "Gold",     min: 1100, max: 1299 },
+  { role: "Silver",   min:  900, max: 1099 },
+  { role: "Bronze",   min:    0, max:  899 },
+];
+
+// simple storage: discordUserId -> gamertag
+const DATA_FILE = path.resolve("./links.json");
+const links = new Map();
+async function loadLinks() {
+  try {
+    const txt = await fs.readFile(DATA_FILE, "utf8");
+    const obj = JSON.parse(txt);
+    for (const [k, v] of Object.entries(obj)) links.set(k, v);
+  } catch {}
+}
+async function saveLinks() {
+  const obj = Object.fromEntries(links.entries());
+  await fs.writeFile(DATA_FILE, JSON.stringify(obj, null, 2), "utf8");
+}
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMembers] });
 
+// Slash commands
 const commands = [
-  new SlashCommandBuilder().setName('rank').setDescription('Update your Halo Infinite rank')
-];
-
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+  new SlashCommandBuilder().setName("link").setDescription("Link your Xbox gamertag").addStringOption(o => o.setName("gamertag").setDescription("Your Xbox gamertag").setRequired(true)),
+  new SlashCommandBuilder().setName("link_other").setDescription("Admin: link someone else").addUserOption(o => o.setName("user").setRequired(true)).addStringOption(o => o.setName("gamertag").setRequired(true)).setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder().setName("unlink").setDescription("Unlink your gamertag"),
+  new SlashCommandBuilder().setName("rank").setDescription("Show Ranked Arena CSR").addUserOption(o => o.setName("user").setDescription("User to check")),
+  new SlashCommandBuilder().setName("refresh").setDescription("Admin: refresh all").setDefaultMemberPermissions(PermissionFlagsBits.ManageNicknames),
+].map(c => c.toJSON());
 
 async function registerCommands() {
-  try {
-    await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-      { body: commands }
-    );
-    console.log('Commands registered');
-  } catch (err) {
-    console.error(err);
+  const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
+  const app = await client.application.fetch(); // no CLIENT_ID needed
+  await rest.put(Routes.applicationGuildCommands(app.id, GUILD_ID), { body: commands });
+}
+
+async function fetchCSR(gamertag) {
+  if (!HALO_ENDPOINT || !HALO_SHARED_SECRET) throw new Error("HALO_ENDPOINT or HALO_SHARED_SECRET missing");
+  const url = new URL(HALO_ENDPOINT);
+  url.searchParams.set("gt", gamertag);
+  url.searchParams.set("playlist", RANK_PLAYLIST_ID);
+  const res = await request(url.toString(), { headers: { "x-halo-auth": HALO_SHARED_SECRET } });
+  if (res.statusCode >= 400) throw new Error(`Worker responded ${res.statusCode}`);
+  const data = await res.body.json(); // { csr, tier }
+  return { csr: data?.csr ?? null, tier: data?.tier ?? null };
+}
+
+function canonicalTier(label, csr) {
+  const L = (label || "").toLowerCase();
+  if (L.startsWith("onyx")) return "Onyx";
+  if (L.startsWith("diamond")) return "Diamond";
+  if (L.startsWith("platinum")) return "Platinum";
+  if (L.startsWith("gold")) return "Gold";
+  if (L.startsWith("silver")) return "Silver";
+  if (L.startsWith("bronze")) return "Bronze";
+  if (typeof csr === "number" && Number.isFinite(csr)) {
+    const hit = CSR_RANGES.find(r => csr >= r.min && csr <= r.max);
+    if (hit) return hit.role;
   }
+  return null;
 }
 
-async function getCSR(gamertag) {
-  const res = await fetch(`${process.env.HALO_ENDPOINT}?gamertag=${encodeURIComponent(gamertag)}`, {
-    headers: { 'x-shared-secret': process.env.HALO_SHARED_SECRET }
-  });
-  if (!res.ok) return null;
-  return res.json();
-}
+async function applyRankDecorations(member, csr, label) {
+  const base = member.user.username;
+  const csrStr = (typeof csr === "number" && Number.isFinite(csr)) ? String(csr) : "—";
+  const newNick = `${csrStr} | ${base}`.slice(0, 32);
+  await member.setNickname(newNick).catch(()=>{});
 
-function csrToTier(csr) {
-  if (csr >= 1800) return 'Onyx';
-  if (csr >= 1500) return 'Diamond';
-  if (csr >= 1200) return 'Platinum';
-  if (csr >= 900) return 'Gold';
-  if (csr >= 600) return 'Silver';
-  return 'Bronze';
-}
+  const roleName = canonicalTier(label, csr);
+  const rankRoles = ["Bronze", "Silver", "Gold", "Platinum", "Diamond", "Onyx"];
+  const guildRoles = member.guild.roles.cache;
 
-client.on('ready', () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  if (process.env.CRON_HOURS) {
-    cron.schedule(`0 */${process.env.CRON_HOURS} * * *`, async () => {
-      for (const guild of client.guilds.cache.values()) {
-        const members = await guild.members.fetch();
-        members.forEach(async (member) => {
-          const gamertag = member.user.username; // simple placeholder
-          const csrData = await getCSR(gamertag);
-          if (!csrData) return;
-          const tier = csrToTier(csrData.csr);
-          const role = guild.roles.cache.find(r => r.name.toLowerCase() === tier.toLowerCase());
-          if (role) {
-            await member.roles.add(role).catch(() => {});
-          }
-          if (process.env.ENABLE_NICKNAME_UPDATES === 'true') {
-            await member.setNickname(`${gamertag} [${tier} ${csrData.csr}]`).catch(() => {});
-          }
-        });
-      }
-    });
-  }
-});
-
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName === 'rank') {
-    const gamertag = interaction.user.username;
-    const csrData = await getCSR(gamertag);
-    if (!csrData) return interaction.reply('Could not fetch rank.');
-    const tier = csrToTier(csrData.csr);
-    const role = interaction.guild.roles.cache.find(r => r.name.toLowerCase() === tier.toLowerCase());
-    if (role) await interaction.member.roles.add(role).catch(() => {});
-    if (process.env.ENABLE_NICKNAME_UPDATES === 'true') {
-      await interaction.member.setNickname(`${gamertag} [${tier} ${csrData.csr}]`).catch(() => {});
+  for (const rr of rankRoles) {
+    const r = guildRoles.find(x => x.name === rr);
+    if (r && member.roles.cache.has(r.id) && rr !== roleName) {
+      await member.roles.remove(r).catch(()=>{});
     }
-    await interaction.reply(`You are ${tier} ${csrData.csr}`);
+  }
+  if (roleName) {
+    const wanted = guildRoles.find(x => x.name === roleName);
+    if (wanted && !member.roles.cache.has(wanted.id)) {
+      await member.roles.add(wanted).catch(()=>{});
+    }
+  }
+}
+
+async function refreshAll() {
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const members = await guild.members.fetch();
+  for (const [userId, gt] of links.entries()) {
+    const m = members.get(userId);
+    if (!m) continue;
+    try {
+      const { csr, tier } = await fetchCSR(gt);
+      if (csr == null && !tier) continue;
+      await applyRankDecorations(m, csr, tier);
+    } catch {}
+  }
+}
+
+client.once("ready", async () => {
+  await loadLinks();
+  try { await registerCommands(); } catch {}
+  console.log(`Logged in as ${client.user.tag}`);
+  if (ENABLE_NICKNAME_UPDATES === "true") {
+    const spec = `0 */${Number(CRON_HOURS)} * * *`;
+    cron.schedule(spec, () => { refreshAll().catch(()=>{}); }, { timezone: "UTC" });
+    console.log(`Auto-refresh scheduled every ${CRON_HOURS}h`);
   }
 });
 
-client.login(process.env.DISCORD_TOKEN);
-registerCommands();
+client.on("interactionCreate", async (i) => {
+  if (!i.isChatInputCommand()) return;
+  try {
+    if (i.commandName === "link") {
+      const gt = i.options.getString("gamertag", true);
+      links.set(i.user.id, gt); await saveLinks();
+      return i.reply({ content: `Linked **${gt}** to <@${i.user.id}>.`, ephemeral: true });
+    }
+    if (i.commandName === "link_other") {
+      const target = i.options.getUser("user", true);
+      const gt = i.options.getString("gamertag", true);
+      links.set(target.id, gt); await saveLinks();
+      return i.reply({ content: `Linked **${gt}** to <@${target.id}>.`, ephemeral: true });
+    }
+    if (i.commandName === "unlink") {
+      links.delete(i.user.id); await saveLinks();
+      return i.reply({ content: `Unlinked your gamertag.`, ephemeral: true });
+    }
+    if (i.commandName === "rank") {
+      const target = i.options.getUser("user") ?? i.user;
+      const gt = links.get(target.id);
+      if (!gt) return i.reply({ content: `No gamertag linked for <@${target.id}>. Use **/link <gamertag>**.`, ephemeral: true });
+
+      await i.deferReply();
+      const { csr, tier } = await fetchCSR(gt);
+      if (csr == null && !tier) return i.editReply(`Couldn’t fetch Ranked Arena CSR for **${gt}**.`);
+      const roleName = canonicalTier(tier, csr) ?? (tier || "Rank");
+      await i.editReply(`**${target.username}** — **${roleName}** ${csr ?? ""}`);
+      const guild = await client.guilds.fetch(GUILD_ID);
+      const member = await guild.members.fetch(target.id).catch(()=>null);
+      if (member) await applyRankDecorations(member, csr, tier);
+    }
+    if (i.commandName === "refresh") {
+      await i.deferReply({ ephemeral: true });
+      await refreshAll();
+      await i.editReply("Refresh complete.");
+    }
+  } catch {
+    if (!i.replied) await i.reply({ content: "Error. Check logs.", ephemeral: true });
+  }
+});
+
+client.login(DISCORD_TOKEN);
